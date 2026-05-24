@@ -23,10 +23,15 @@ TOKENS = {
     "INJ":  {"id": "injective-protocol", "pru": 15.49},
 }
 
-TRANCHES = [
+SELL_TRANCHES = [
     {"level": "T3", "pct": 30, "min_score": 5, "emoji": "🔴"},
     {"level": "T2", "pct": 30, "min_score": 3, "emoji": "🟠"},
-    {"level": "T1", "pct": 20, "min_score": 1, "emoji": "🟡"},
+    {"level": "T1", "pct": 20, "min_score": 2, "emoji": "🟡"},
+]
+
+BUY_TRANCHES = [
+    {"level": "DCA FORT", "pct": 15, "min_score": 4, "emoji": "💚"},
+    {"level": "DCA",      "pct": 10, "min_score": 2, "emoji": "🟢"},
 ]
 
 def fetch_ohlcv(coin_id, days=90):
@@ -54,13 +59,17 @@ def compute_macd_state(closes):
     macd = ema12 - ema26
     signal = macd.ewm(span=9, adjust=False).mean()
     hist = macd - signal
+    if macd.iloc[-1] > signal.iloc[-1] and macd.iloc[-2] <= signal.iloc[-2]:
+        return "bullish_cross"
     if macd.iloc[-1] < signal.iloc[-1] and macd.iloc[-2] >= signal.iloc[-2]:
         return "bearish_cross"
+    if hist.iloc[-1] > hist.iloc[-2]:
+        return "increasing"
     if hist.iloc[-1] < hist.iloc[-2]:
         return "decreasing"
-    return "bullish"
+    return "neutral"
 
-def compute_score(rsi, macd, greed):
+def compute_sell_score(rsi, macd, greed):
     score, alerts = 0, []
     if rsi >= 85:      score += 3; alerts.append(f"RSI extrême ({rsi:.1f})")
     elif rsi >= 78:    score += 2; alerts.append(f"RSI fort ({rsi:.1f})")
@@ -71,8 +80,18 @@ def compute_score(rsi, macd, greed):
     elif greed >= 75:  score += 1; alerts.append(f"Greed élevé ({greed})")
     return score, alerts
 
-def get_tranche(score):
-    for t in TRANCHES:
+def compute_buy_score(rsi, macd, greed):
+    score, alerts = 0, []
+    if rsi <= 20:      score += 2; alerts.append(f"RSI survente extrême ({rsi:.1f})")
+    elif rsi <= 30:    score += 1; alerts.append(f"RSI survente ({rsi:.1f})")
+    if macd == "bullish_cross":  score += 2; alerts.append("MACD cross haussier")
+    elif macd == "increasing":   score += 1; alerts.append("MACD remonte")
+    if greed <= 15:    score += 2; alerts.append(f"Fear extrême ({greed})")
+    elif greed <= 25:  score += 1; alerts.append(f"Fear élevé ({greed})")
+    return score, alerts
+
+def get_tranche(score, tranches):
+    for t in tranches:
         if score >= t["min_score"]:
             return t
     return None
@@ -86,33 +105,65 @@ def send_telegram(text):
     return r.ok
 
 def run():
-    log.info(f"BOT DÉMARRÉ — {len(TOKENS)} positions")
+    log.info(f"BOT v2 DÉMARRÉ — {len(TOKENS)} positions | SELL + BUY signals")
     fired = {}
+
     while True:
         try:
             greed = fetch_fear_greed()
             log.info(f"Fear & Greed : {greed}")
         except:
-            greed = 72
+            greed = 50
+
         for symbol, cfg in TOKENS.items():
             try:
                 closes = fetch_ohlcv(cfg["id"])
                 price  = closes[-1]
                 rsi    = compute_rsi(closes)
                 macd   = compute_macd_state(closes)
-                sc, alerts = compute_score(rsi, macd, greed)
-                tranche = get_tranche(sc)
-                mult = (price / cfg["pru"]) if cfg["pru"] > 0 else 0
-                log.info(f"  {symbol:10s} RSI={rsi:.0f} score={sc} {tranche['level'] if tranche else 'HOLD'}")
-                if tranche and fired.get(symbol) != tranche["level"]:
-                    msg = f"{tranche['emoji']} *{tranche['level']} — {symbol}*\nPrix: ${price:.6g}\nMultiple PRU: x{mult:.2f}\nVendre *{tranche['pct']}%*\nScore: {sc}/7\n" + "\n".join(f"· {a}" for a in alerts)
+                mult   = (price / cfg["pru"]) if cfg["pru"] > 0 else 0
+
+                # SELL
+                sell_sc, sell_alerts = compute_sell_score(rsi, macd, greed)
+                sell_t = get_tranche(sell_sc, SELL_TRANCHES)
+
+                # BUY
+                buy_sc, buy_alerts = compute_buy_score(rsi, macd, greed)
+                buy_t = get_tranche(buy_sc, BUY_TRANCHES)
+
+                log.info(f"  {symbol:6s} RSI={rsi:.0f} MACD={macd:14s} SELL={sell_sc} BUY={buy_sc}")
+
+                # Envoyer signal SELL
+                if sell_t and fired.get(f"{symbol}_sell") != sell_t["level"]:
+                    msg = (f"{sell_t['emoji']} *{sell_t['level']} SELL — {symbol}*\n"
+                           f"Prix: `${price:.6g}`\n"
+                           f"Multiple PRU: `x{mult:.2f}`\n"
+                           f"Action: Vendre *{sell_t['pct']}%* de la position\n"
+                           f"Score: `{sell_sc}/7`\n"
+                           + "\n".join(f"· {a}" for a in sell_alerts))
                     send_telegram(msg)
-                    fired[symbol] = tranche["level"]
-                elif not tranche:
-                    fired.pop(symbol, None)
+                    fired[f"{symbol}_sell"] = sell_t["level"]
+                elif not sell_t:
+                    fired.pop(f"{symbol}_sell", None)
+
+                # Envoyer signal BUY
+                if buy_t and fired.get(f"{symbol}_buy") != buy_t["level"]:
+                    msg = (f"{buy_t['emoji']} *{buy_t['level']} — {symbol}*\n"
+                           f"Prix: `${price:.6g}`\n"
+                           f"Multiple PRU: `x{mult:.2f}`\n"
+                           f"Action: DCA *{buy_t['pct']}%* du budget alloué\n"
+                           f"Score: `{buy_sc}/6`\n"
+                           + "\n".join(f"· {a}" for a in buy_alerts))
+                    send_telegram(msg)
+                    fired[f"{symbol}_buy"] = buy_t["level"]
+                elif not buy_t:
+                    fired.pop(f"{symbol}_buy", None)
+
                 time.sleep(30)
+
             except Exception as e:
                 log.error(f"  {symbol}: {e}")
+
         log.info(f"Pause {CHECK_INTERVAL}s")
         time.sleep(CHECK_INTERVAL)
 
